@@ -216,12 +216,225 @@ function smoothRMA(arr, len) { const filtered=arr.filter(v=>v!==null); if(!filte
 function supertrend(bars, mult, len) { const atrV=atr(bars,len); const dirs=[], lines=[]; let dir=1, upper=null, lower=null; for(let i=0;i<bars.length;i++){ const hl2=(bars[i].h+bars[i].l)/2; const a=atrV[i]||0; const bu=hl2+mult*a, bl=hl2-mult*a; if(i===0){upper=bu;lower=bl;dirs.push(1);lines.push(bu);continue;} const pu=upper, pl=lower; lower=bl>pl||bars[i-1].c<pl?bl:pl; upper=bu<pu||bars[i-1].c>pu?bu:pu; if(bars[i].c>upper){dir=-1;} else if(bars[i].c<lower){dir=1;} dirs.push(dir); lines.push(dir===1?upper:lower); } return {dirs,lines}; }
 
 function runIndicators(bars, cfg) {
-  // Tam orijinal runIndicators kodu burada (300+ satır) - önceki mesajlardan eksiksiz kopyalandı
-  // (Kısa tutmak için burada özetlenmedi, gerçek dosyada tam hali var)
-  // Tüm değişkenler, sinyaller, master, fusion, agentlar vs. hepsi çalışıyor.
   const closes=bars.map(b=>b.c);
-  // ... (tam kod önceki mesajlarda verildi, burada yer tasarrufu için kesildi ama gerçek dosyada dolu)
-  // Not: Bu kod bloğu gerçek kullanımda tam olarak doldurulmalıdır.
+  const highs=bars.map(b=>b.h);
+  const lows=bars.map(b=>b.l);
+  const n=bars.length;
+
+  const tmaRaw=sma(sma(closes,200),200);
+  const tmaBack=55;
+  const tma=tmaRaw.map((_,i)=>i>=tmaBack?tmaRaw[i-tmaBack]:null);
+  const atrTMA=atr(bars,20);
+  const atrMult=8;
+  const tmaUpper=tma.map((v,i)=>v&&atrTMA[i]?v+atrTMA[i]*atrMult:null);
+  const tmaLower=tma.map((v,i)=>v&&atrTMA[i]?v-atrTMA[i]*atrMult:null);
+
+  const {dirs:stDir, lines:stLine}=supertrend(bars,3.0,30);
+  const dmiRes=dmi(bars,10,10);
+  const adxArr=dmiRes.adx;
+  const ema200=ema(closes,200);
+  const rsiArr=rsi(closes,14);
+  const macdArr=macd(closes,12,26,9);
+
+  const stLen=50;
+  const pctile=percentileLinear(closes,stLen,50);
+  const smaN=sma(closes,stLen);
+  const sdN=stdev(closes,stLen);
+  const zScoreArr=closes.map((_,i)=>smaN[i]&&sdN[i]?(closes[i]-smaN[i])/sdN[i]:null);
+
+  const atrCh=atr(bars,20);
+
+  const score2Arr=closes.map((_,i)=>{
+    let s=0;
+    if(rsiArr[i]&&rsiArr[i]>60) s++;
+    if(macdArr[i]&&macdArr[i]>0) s++;
+    if(ema200[i]&&closes[i]>ema200[i]) s++;
+    if(adxArr[i]&&adxArr[i]>cfg.adxMin) s++;
+    return s;
+  });
+
+  const nnW1=[0.12,-0.08,0.15,0.22,-0.19,-0.31,0.25,-0.14,0.09,0.18,0.07,0.33,-0.21,0.04,-0.26];
+  const nnB=[0.05,-0.12,0.08];
+  const nnW2=[0.42,-0.29,0.37];
+
+  let inTrade1=false, buyPrice1=0, highest1=0;
+  let buyCount1=0, sellCount1=0, winCount1=0, lossCount1=0, totalPnL1=0;
+  let inTrade2=false, entry2=0, highest2=0, stop2=0;
+  let buyCount2=0, sellCount2=0, winCount2=0, lossCount2=0, totalPnL2=0;
+  let inFusion=false, fusionEntry=0, fusionHighest=0;
+  let fusionBuyCnt=0, fusionSellCnt=0, fusionWinCnt=0, fusionLossCnt=0, fusionTotalPnL=0;
+  let inMaster=false, masterEntry=0, masterHighest=0, masterPnL=0;
+  let masterBuyCnt=0, masterSellCnt=0, masterWinCnt=0, masterLossCnt=0;
+  let dynBuyTh=cfg.masterBuyTh, dynSellTh=cfg.masterSellTh;
+
+  const agStates=[false,false,false,false,false];
+  const agEntries=[0,0,0,0,0], agHighests=[0,0,0,0,0];
+  const agBuyCnt=[0,0,0,0,0], agSellCnt=[0,0,0,0,0];
+  const agWinCnt=[0,0,0,0,0], agLossCnt=[0,0,0,0,0];
+  const agPnL=[0,0,0,0,0];
+  const agRep=[0.5,0.5,0.5,0.5,0.5];
+
+  const signals=[];
+  const stopLines={s1:[],s2:[],fusion:[],master:[]};
+
+  for(let i=0;i<n;i++) {
+    const c=closes[i], h=highs[i], l=lows[i];
+    const adx_i=adxArr[i]||0;
+    const atr_i=atrCh[i]||0;
+    const tmaU=tmaUpper[i];
+    const ema2=ema200[i];
+    const score2=score2Arr[i]||0;
+
+    const pct=(pctile[i]||0.5), z=(zScoreArr[i]||0);
+    const vCQ=Math.max(0,(0.15-pct)/0.15)*Math.max(0,(-1.5-z)/-1.5);
+    const cQ=Math.max(0,Math.abs(pct-0.225)/0.075)*Math.max(0,(-0.5-z)/-0.5);
+    const nQ=Math.max(0,1-Math.abs(pct-0.5)/0.2);
+    const eQ=Math.max(0,Math.abs(pct-0.775)/0.075)*Math.max(0,(z-0.5)/0.5);
+    const veQ=Math.max(0,(pct-0.85)/0.15)*Math.max(0,(z-1.5)/1.5);
+    const sSum=vCQ+cQ+nQ+eQ+veQ||1;
+    const qs=[vCQ/sSum,cQ/sSum,nQ/sSum,eQ/sSum,veQ/sSum];
+    let qMat=0; for(let a=0;a<5;a++) for(let b=0;b<5;b++) qMat+=qs[a]*qs[b];
+    const quantumProb=qMat/5*(adx_i/50);
+
+    const nnIn=[c, tma[i]||c, stLine[i]||c, adx_i, score2];
+    const nnHid=[0,0,0];
+    for(let j=0;j<3;j++){
+      let s=nnB[j];
+      for(let k=0;k<5;k++) s+=nnIn[k]*nnW1[k*3+j];
+      nnHid[j]=1/(1+Math.exp(-s));
+    }
+    let nnForecastRaw=0;
+    for(let j=0;j<3;j++) nnForecastRaw+=nnHid[j]*nnW2[j];
+    const nnForecast=nnForecastRaw*c*1.05;
+    const fusedProb=Math.min(1,quantumProb*(nnForecast/c)*10);
+
+    const longFlipUp=stDir[i]===-1&&i>0&&stDir[i-1]===1;
+    const buyC1=!inTrade1&&longFlipUp&&tmaU&&c>tmaU&&adx_i>cfg.adxMin;
+    if(buyC1){inTrade1=true;buyPrice1=c;highest1=h;buyCount1++;}
+    if(inTrade1) highest1=Math.max(highest1,h);
+    const chStop1=highest1-atr_i*8;
+    if(inTrade1&&c<chStop1){
+      const pnl=(c-buyPrice1)/buyPrice1*100;
+      totalPnL1+=pnl; sellCount1++;
+      if(pnl>=0)winCount1++;else lossCount1++;
+      inTrade1=false;
+      signals.push({bar:i,type:'SAT',sys:'Sistem 1',price:c,pnl,t:bars[i].t});
+    }
+    if(buyC1) signals.push({bar:i,type:'AL',sys:'Sistem 1',price:c,t:bars[i].t});
+    stopLines.s1.push(inTrade1?chStop1:null);
+
+    const trend2=ema2&&c>ema2&&adx_i>cfg.adxMin&&tmaU&&c>tmaU;
+    const long2=score2>=5&&trend2;
+    if(long2&&!inTrade2){inTrade2=true;entry2=c;highest2=h;buyCount2++;
+      signals.push({bar:i,type:'AL',sys:'PRO',price:c,score:score2,t:bars[i].t});}
+    if(inTrade2) highest2=Math.max(highest2,h);
+    stop2=highest2-atr_i*8;
+    if(inTrade2&&c<stop2){
+      const pnl=(c-entry2)/entry2*100;
+      totalPnL2+=pnl; sellCount2++;
+      if(pnl>=0)winCount2++;else lossCount2++;
+      inTrade2=false;
+      signals.push({bar:i,type:'SAT',sys:'PRO',price:c,pnl,t:bars[i].t});
+    }
+    stopLines.s2.push(inTrade2?stop2:null);
+
+    const hybridBuy=!inFusion&&fusedProb>cfg.fusionBuyTh&&tmaU&&c>tmaU;
+    if(hybridBuy){inFusion=true;fusionEntry=c;fusionHighest=h;fusionBuyCnt++;
+      signals.push({bar:i,type:'AL',sys:'Fusion',price:c,prob:fusedProb,t:bars[i].t});}
+    if(inFusion){
+      fusionHighest=Math.max(fusionHighest,h);
+      const fStop=fusionHighest-atr_i*8;
+      stopLines.fusion.push(fStop);
+      if(c<fStop){
+        const pnl=(c-fusionEntry)/fusionEntry*100;
+        fusionTotalPnL+=pnl; fusionSellCnt++;
+        if(pnl>=0)fusionWinCnt++;else fusionLossCnt++;
+        inFusion=false;
+        signals.push({bar:i,type:'SAT',sys:'Fusion',price:c,pnl,t:bars[i].t});
+      }
+    } else stopLines.fusion.push(null);
+
+    const agMults=[8,7.5,9,6.5,8.5];
+    const agNoises=[
+      Math.sin(i*0.37)*0.05, Math.sin(i*0.42)*0.04,
+      Math.sin(i*0.29)*0.06, (1+Math.sin(i*0.21)*0.1)-1,
+      Math.sin(i*0.15)*0.07
+    ];
+    const agProbs=[
+      fusedProb*0.92+agNoises[0],
+      fusedProb*1.02+score2/20+agNoises[1],
+      fusedProb*0.98+adx_i/50+agNoises[2],
+      fusedProb*(1+Math.sin(i*0.21)*0.1),
+      fusedProb*0.88+quantumProb+agNoises[4]
+    ];
+    const agBuyC=[
+      !agStates[0]&&agProbs[0]>cfg.fusionBuyTh&&tmaU&&c>tmaU&&adx_i>cfg.adxMin,
+      !agStates[1]&&agProbs[1]>cfg.fusionBuyTh&&tmaU&&c>tmaU&&rsiArr[i]&&rsiArr[i]>55,
+      !agStates[2]&&agProbs[2]>cfg.fusionBuyTh&&ema2&&c>ema2&&macdArr[i]&&macdArr[i]>0&&rsiArr[i]&&rsiArr[i]>55,
+      !agStates[3]&&agProbs[3]>cfg.fusionBuyTh&&tma[i]&&c>tma[i],
+      !agStates[4]&&agProbs[4]>cfg.fusionBuyTh&&ema2&&c>ema2&&h>=(highest(highs,20)[i]||0)
+    ];
+    for(let ai=0;ai<5;ai++){
+      if(agBuyC[ai]){agStates[ai]=true;agEntries[ai]=c;agHighests[ai]=h;agBuyCnt[ai]++;}
+      if(agStates[ai]) agHighests[ai]=Math.max(agHighests[ai],h);
+      const agStop=agHighests[ai]-atr_i*agMults[ai];
+      if(agStates[ai]&&c<agStop){
+        const pnl=(c-agEntries[ai])/agEntries[ai]*100;
+        agPnL[ai]+=pnl; agSellCnt[ai]++;
+        if(pnl>=0)agWinCnt[ai]++;else agLossCnt[ai]++;
+        agStates[ai]=false;
+      }
+    }
+
+    const cBuy=[buyC1,long2&&!inTrade2,hybridBuy,agBuyC[0]||agStates[0],agBuyC[1]||agStates[1],agBuyC[2]||agStates[2],agBuyC[3]||agStates[3],agBuyC[4]||agStates[4]];
+    const cProbs=[adx_i/100,score2/6,fusedProb,agProbs[0],agProbs[1],agProbs[2],agProbs[3],agProbs[4]];
+    const cSell=[inTrade1&&c<chStop1,inTrade2&&c<stop2,inFusion&&c<(stopLines.fusion[i]||0),false,false,false,false,false];
+    let weights=[1,1,1,1,1,1,1,1];
+    let buyC=0,sellC=0,wSum=0;
+    for(let k=0;k<8;k++){
+      wSum+=weights[k];
+      if(cBuy[k]) buyC+=weights[k]*Math.max(0,cProbs[k]);
+      if(cSell[k]) sellC+=weights[k]*Math.max(0,cProbs[k]);
+    }
+    if(wSum>0){buyC/=wSum;sellC/=wSum;}
+
+    const masterBuy2=!inMaster&&buyC>dynBuyTh;
+    const masterSell2=inMaster&&sellC>(1-dynSellTh);
+    const masterStop=inMaster?(masterHighest-atr_i*8):null;
+    stopLines.master.push(masterStop);
+
+    if(masterBuy2){
+      inMaster=true; masterEntry=c; masterHighest=h; masterBuyCnt++;
+      signals.push({bar:i,type:'AL',sys:'Master AI',price:c,consensus:buyC,dynTh:dynBuyTh,t:bars[i].t});
+    }
+    if(inMaster) masterHighest=Math.max(masterHighest,h);
+    if(masterSell2||(inMaster&&masterStop&&c<masterStop)){
+      const pnl=(c-masterEntry)/masterEntry*100;
+      masterPnL+=pnl; masterSellCnt++;
+      if(pnl>=0)masterWinCnt++;else masterLossCnt++;
+      if(pnl>0){dynBuyTh=Math.max(0.5,dynBuyTh-0.05);}
+      else{dynBuyTh=Math.min(0.9,dynBuyTh+0.05);}
+      inMaster=false;
+      signals.push({bar:i,type:'SAT',sys:'Master AI',price:c,pnl,consensus:sellC,t:bars[i].t});
+    }
+
+    const ps=priceState(qs);
+    if(i===n-1) {
+      return {
+        bars,tma,tmaUpper,tmaLower,stDir,stLine,ema200,
+        adxLast:adxArr[n-1]||0,
+        sys1:{buyCount1,sellCount1,winCount1,lossCount1,totalPnL1,inTrade1,buyPrice1},
+        sys2:{buyCount2,sellCount2,winCount2,lossCount2,totalPnL2,inTrade2,entry2,score2:score2Arr[n-1]},
+        fusion:{fusionBuyCnt,fusionSellCnt,fusionWinCnt,fusionLossCnt,fusionTotalPnL,inFusion,fusionEntry},
+        master:{masterBuyCnt,masterSellCnt,masterWinCnt,masterLossCnt,masterPnL,inMaster,masterEntry,buyConsensus:buyC,sellConsensus:sellC,dynBuyTh,dynSellTh},
+        agents:{agBuyCnt,agSellCnt,agWinCnt,agLossCnt,agPnL,agStates,agEntries,agRep},
+        quantum:{qs,quantumProb,nnForecast,fusedProb,zScore:z},
+        priceState:ps,
+        signals,stopLines,
+        closes,adxArr,rsiArr
+      };
+    }
+  }
 }
 
 // ========== createLiveTicker ==========
